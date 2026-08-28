@@ -1,4 +1,26 @@
+# OS
+.DS_Store
+
+# Script output — inventory TSVs may contain customer namespace and cluster names
 out/
 *.tsv
-.DS_Store
+
+# Local cluster list (the example is committed; the real one is not)
+clusters.conf
+
+# Env / secrets — the scripts delegate auth to the Temporal CLI, but keep any
+# stray credential material out of git regardless.
+.env
+.env.*
+*.key
+*.pem
+*-apikey*
+*.tmprl.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Local-only sensitive-marker denylist for the pre-commit hook (never commit)
 .githooks/patterns.local

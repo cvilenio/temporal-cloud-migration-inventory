@@ -43,3 +43,17 @@ Escape hatches (use your judgement - a block can be a false positive):
 [`.githooks/prepare-commit-msg`](.githooks/prepare-commit-msg) strips `Co-authored-by:`
 trailers that AI agents inject into commit messages.
 Author and committer are left unchanged.
+
+## Commit & PR conventions
+
+Commit subjects follow [Conventional Commits](https://www.conventionalcommits.org/), matching
+the existing history:
+
+- Type prefix: `feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `ci:`.
+- Imperative mood, lowercase after the type, no trailing period, subject under ~72 chars.
+- Body optional; wrap ~72 cols; explain *why*, not what.
+- No `Co-authored-by:` or generated-by-agent trailers.
+
+Changes land through a pull request rather than a direct push to `main`, rebase-merged for a
+linear history.
+The PR body is where the reasoning is recorded: summary, why, key changes, how it was verified.
