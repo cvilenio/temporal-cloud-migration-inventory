@@ -273,7 +273,12 @@ do_cluster() {
   CJ="$(t operator cluster describe --output json 2>/dev/null || echo '{}')"
   THIS_CLUSTER="$(jq -r '.clusterName // .ClusterName // "UNKNOWN"' <<<"$CJ")"
   SERVER_VERSION="$(jq -r '.serverVersion // .ServerVersion // "UNKNOWN"' <<<"$CJ")"
-  printf '%s\t%s\t%s\t%s\n' "$CLUSTER_ID" "$RUN_TS" "$THIS_CLUSTER" "$SERVER_VERSION" >> "$CL_OUT"
+  # Replace this cluster's row rather than appending a second one, so a re-run
+  # refreshes in place and the file stays one row per cluster.
+  _cltmp="$(mktemp)"
+  awk -F'\t' -v cid="$CLUSTER_ID" 'FNR==1 {print; next} $1!=cid {print}' "$CL_OUT" > "$_cltmp"
+  printf '%s\t%s\t%s\t%s\n' "$CLUSTER_ID" "$RUN_TS" "$THIS_CLUSTER" "$SERVER_VERSION" >> "$_cltmp"
+  mv "$_cltmp" "$CL_OUT"
 
   if [ "$THIS_CLUSTER" = UNKNOWN ]; then
     echo "  WARN [$CLUSTER_ID] cluster describe returned nothing - connection may be failing." >&2
@@ -305,7 +310,16 @@ MSG
     return 1
   fi
 
-  VIS_KIND="$(probe_visibility "${NS_LIST[0]}")"
+  # Probe more than the first namespace: if that one happens to be inaccessible
+  # the answer is 'unknown' and the standard-SQL cost warning is never shown.
+  VIS_KIND=unknown
+  _tries=0
+  for _pns in ${NS_LIST[@]+"${NS_LIST[@]}"}; do
+    VIS_KIND="$(probe_visibility "$_pns")"
+    [ "$VIS_KIND" != unknown ] && break
+    _tries=$((_tries+1))
+    [ "$_tries" -ge 3 ] && break
+  done
   echo "  [$CLUSTER_ID] ${#NS_LIST[@]} namespace(s), visibility=$VIS_KIND" >&2
   if [ "$VIS_KIND" = standard ]; then
     cat >&2 <<'MSG'
@@ -350,7 +364,23 @@ MSG
   done
   wait
   [ "$PARALLEL" -gt 1 ] && echo "    $RAN/${#NS_LIST[@]} done" >&2
-  cat "$NSTMP"/* >> "$NS_OUT" 2>/dev/null || true
+  # Merge by row_key rather than blind append. A namespace collected again
+  # replaces its previous row, so re-running without --resume genuinely
+  # refreshes instead of leaving a stale duplicate that the sheet would match
+  # first. Order is preserved: survivors keep their place, new rows go last.
+  _new="$(mktemp)"
+  cat "$NSTMP"/* > "$_new" 2>/dev/null || true
+  if [ -s "$_new" ]; then
+    _merged="$(mktemp)"
+    awk -F'\t' '
+      NR==FNR { if ($1 != "") k[$1]=1; next }
+      FNR==1  { print; next }
+      !($1 in k) { print }
+    ' "$_new" "$NS_OUT" > "$_merged"
+    cat "$_new" >> "$_merged"
+    mv "$_merged" "$NS_OUT"
+  fi
+  rm -f "$_new"
   rm -rf "$NSTMP"
   [ "$SKIPPED" -gt 0 ] && echo "    resumed: skipped $SKIPPED already in $NS_OUT" >&2
   return 0
@@ -362,8 +392,9 @@ echo "run_ts=$RUN_TS UTC  window=${WINDOW_DAYS}d  sample=$SAMPLE" >&2
 
 if [ -n "$CLUSTERS_FILE" ]; then
   [ -r "$CLUSTERS_FILE" ] || { echo "cannot read $CLUSTERS_FILE" >&2; exit 2; }
-  while IFS=$'\t' read -r CID CENV _rest; do
-    case "${CID:-}" in ''|\#*) continue ;; esac
+  # `|| [ -n "$CID" ]` so a final line with no trailing newline is not dropped.
+  while IFS=$'\t' read -r CID CENV _rest || [ -n "${CID:-}" ]; do
+    case "${CID:-}" in ''|\#*) CID=""; continue ;; esac
     CENV="$(printf '%s' "${CENV:-}" | tr -d ' \r')"
     [ -z "$CENV" ] && { echo "  skip [$CID] no TEMPORAL_ENV in clusters.conf" >&2; continue; }
     CONN_ARGS=(--env "$CENV")
@@ -380,7 +411,10 @@ else
 fi
 
 # --- the collision that decides whether script B needs a cluster label ------
-DUPES="$(awk -F'\t' 'NR>1 && $4!="" {print $4}' "$NS_OUT" | sort | uniq -d)"
+# Compare DISTINCT cluster/namespace pairs, not raw rows. Counting rows would
+# report a collision whenever the same namespace was simply collected twice.
+DUPES="$(awk -F'\t' 'NR>1 && $2!="" && $4!="" {print $2"\t"$4}' "$NS_OUT" \
+  | sort -u | cut -f2 | sort | uniq -d)"
 {
   echo
   echo "wrote $CL_OUT and $NS_OUT"

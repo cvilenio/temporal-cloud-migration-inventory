@@ -58,7 +58,7 @@ Script A takes flags:
 | :- | :- | :- |
 | `--clusters FILE` | Cluster list to walk. Scope of a run is whatever is in this file. | |
 | `--out DIR` | Output directory. Defaults to `./out`. | |
-| `--resume` | Skips namespaces whose row key is already in `namespaces.tsv`. | Does not refresh existing rows. |
+| `--resume` | Skips namespaces whose row key is already in `namespaces.tsv`. | Saves the work, so already-collected rows keep their original data. Omit it to refresh. |
 | `--parallel N` | N namespaces at a time, default 1. Wall clock falls roughly linearly. | Peak visibility load rises by the same factor. |
 | `--skip-oldest-open` | Drops the most expensive call, which pages up to 1000 open executions. | Loses the `oldest_open_execution_days` column. |
 
@@ -95,9 +95,11 @@ There is no batch flag. The scope of a run is whatever is in the file you point 
 ./scripts/A-cli-inventory.sh --clusters wave2.conf --out ./out --resume
 ```
 
-Output files append rather than overwrite, and headers are written only when a file is new. Every namespace row is keyed on cluster ID plus namespace name, so runs against different conf files accumulate in the same TSVs.
+Output files accumulate across runs, and headers are written only when a file is new. Every namespace row is keyed on cluster ID plus namespace name, and every cluster row on cluster ID, so runs against different conf files build up in the same TSVs.
 
-`--resume` tracks progress rather than scope. It builds its skip list from the row keys already in `namespaces.tsv`, so it covers everything collected so far, not just the conf file being run.
+Rows merge by key rather than being blindly appended. Collecting a namespace again replaces its previous row, so the file holds exactly one current row per key no matter how many runs produced it. That makes a re-run a genuine refresh, and means the files are always safe to paste over a sheet's paste zone wholesale.
+
+`--resume` tracks progress rather than scope. It builds its skip list from the row keys already in `namespaces.tsv`, so it covers everything collected so far, not just the conf file being run. Use it to continue an interrupted run; omit it to re-collect and refresh.
 
 ## Reading the output
 

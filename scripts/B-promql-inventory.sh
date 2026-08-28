@@ -234,7 +234,8 @@ RQ="sum(rate(service_requests{$LOAD_OP}[5m])) by ($NSLABEL)[${DAYS}d:5m]"
             sprintf("%.0f", av), (suppressed ? "" : sprintf("%.1f", perday)),
             sprintf("%.0f", x), sprintf("%.0f", w), apx
     }
-  }' | awk -F'\t' -v cid="$CLUSTER_ID" 'NR==1{print;next}{ $1=cid"/"$1; print }' OFS='\t' | sort -t"$(printf '\t')" -k1,1
+  }' | awk -F'\t' -v cid="$CLUSTER_ID" 'NR==1{print;next}{ $1=cid"/"$1; print }' OFS='\t' \
+     | { IFS= read -r _hdr; printf '%s\n' "$_hdr"; sort -t"$(printf '\t')" -k1,1; }
 
 cat >&2 <<MSG
 
