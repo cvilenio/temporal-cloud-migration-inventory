@@ -44,7 +44,7 @@
 # COMPATIBILITY: bash 3.2 (stock macOS /bin/bash). Requires: temporal CLI, jq.
 # ===========================================================================
 set -uo pipefail
-SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.0}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.1}"
 
 CLUSTERS_FILE=""
 OUT="./out"
@@ -178,6 +178,9 @@ do_namespace() {
     elif [ "$ACTIVE" = "$THIS_CLUSTER" ];       then ROLE="Global - active on this cluster"
     else                                             ROLE="Global - standby on this cluster"; fi
     REPL_TO="$(tr ';' '\n' <<<"$CLUSTERS" | grep -vxF "$THIS_CLUSTER" | paste -sd';' -)"
+    # Role is derived from an empty object when describe failed, which silently
+    # reports every unreadable namespace as Local and feeds the standby rollups.
+    [ "$NS_READABLE" = 0 ] && { ROLE=""; REPL_TO=""; }
 
     CNTJ="$(cnt_grouped "$NS")"
     VISIBLE="$(jq -r '.count // 0 | tonumber? // 0' <<<"$CNTJ")"
@@ -240,6 +243,9 @@ do_namespace() {
     else
       AGE_D="NONE OPEN"
     fi
+    if [ "$NS_READABLE" = 0 ]; then
+      AGE_D=""
+    fi
 
     printf '%s/%s\t%s\t%s\t%s\t%s\t%s\t%s\t' \
       "$CLUSTER_ID" "$NS" "$CLUSTER_ID" "$RUN_TS" "$NS" "$ROLE" "$REPL_TO" "${RET:-}" >> "$OUTF"
@@ -259,8 +265,14 @@ do_namespace() {
         if (n == 0) {
           # Five tabs, not four: fields 10-13 (gb, max_kb, max_events, avg_kb)
           # are all blank here, and one short shifts every later column left.
-          printf "\t%s\t\t\t\t\t0\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
-                 age, sched, vis, mix, sac, sabt,
+          printf "\t%s\t\t\t\t\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                 age,
+                 (readable == 0 ? "" : "0"),
+                 (readable == 0 ? "" : sched),
+                 (readable == 0 ? "" : sprintf("%d", vis)),
+                 (readable == 0 ? "" : mix),
+                 (readable == 0 ? "" : sac),
+                 (readable == 0 ? "" : sabt),
                  (readable == 0 ? "" : saf),
                  (readable == 0 ? "NAMESPACE UNREADABLE - values not collected" : "no executions in window")
           exit
@@ -375,12 +387,11 @@ MSG
       RAN=$((RAN+1))
       if [ $((RAN % PARALLEL)) -eq 0 ]; then
         wait
-        echo "    $RAN/${#NS_LIST[@]} done" >&2
       fi
     fi
   done
   wait
-  [ "$PARALLEL" -gt 1 ] && [ $((RAN % PARALLEL)) -ne 0 ] && echo "    $RAN/${#NS_LIST[@]} done" >&2
+  [ "$PARALLEL" -gt 1 ] && echo "    $RAN/${#NS_LIST[@]} done" >&2
   # Merge by row_key rather than blind append. A namespace collected again
   # replaces its previous row, so re-running without --resume genuinely
   # refreshes instead of leaving a stale duplicate. Order is preserved:

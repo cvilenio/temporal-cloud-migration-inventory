@@ -21,11 +21,19 @@
 # COMPATIBILITY: bash 3.2 (stock macOS /bin/bash). Requires: curl, jq, awk.
 # ===========================================================================
 set -uo pipefail
-SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.0}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.1}"
 
+echo "# script=B-promql-inventory.sh version=$SCRIPT_VERSION" >&2
 PROM="${PROM_URL:?set PROM_URL, e.g. http://localhost:9090}"
 CLUSTER_ID="${CLUSTER_ID:-UNKNOWN}"
 DAYS="${WINDOW_DAYS:-${DAYS:-30}}"
+# Whole days, at least 1. A zero divides by zero downstream and emits a
+# fabricated actions_per_day; a fraction leaves `start` unset and every query
+# then runs from the Unix epoch. Both used to exit 0 with a plausible row.
+case "$DAYS" in
+  ''|*[!0-9]*) echo "WINDOW_DAYS must be a whole number of days (got '$DAYS')" >&2; exit 2 ;;
+esac
+[ "$DAYS" -lt 1 ] && { echo "WINDOW_DAYS must be at least 1 (got '$DAYS'). A metrics store holding less than a day cannot support these columns." >&2; exit 2; }
 STEP="${STEP:-300}"
 MIN_COVERAGE="${MIN_COVERAGE:-20}"
 SKIP_NS="${SKIP_NS:-temporal-system temporal_system}"
@@ -76,7 +84,6 @@ skip_ns() {
 # =============================================== discovery, all to stderr
 {
 echo "# =============================================================="
-echo "# script=B-promql-inventory.sh version=$SCRIPT_VERSION"
 echo "# run_ts=$RUN_TS UTC  cluster_id=$CLUSTER_ID  window=${DAYS}d  step=${STEP}s"
 
 # --- which label carries the namespace

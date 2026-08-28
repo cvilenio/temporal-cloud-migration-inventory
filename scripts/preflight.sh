@@ -2,7 +2,7 @@
 # Preflight every cluster in clusters.conf. Classifies the failure, because
 # "cannot connect" and "connected but rejected" need different fixes.
 set -uo pipefail
-SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.0}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.1}"
 case "${1:-}" in
   -h|--help) sed -n '2,3p' "$0"; echo "usage: $0 [clusters.conf]"; exit 0 ;;
 esac
@@ -23,8 +23,8 @@ while IFS=$'\t' read -r CID CENV _rest || [ -n "${CID:-}" ]; do
     RESULT="OK"; DETAIL="$NAME"
   else
     case "$ERR" in
-      *"certificate is valid for"*)
-        RESULT="AUTH FAILED"; DETAIL="server cert does not cover this address - set tls-server-name on env '$CENV' to a name in the cert" ;;
+      *"certificate is valid for"*|*"IP SANs"*|*"doesn't contain any IP SANs"*)
+        RESULT="AUTH FAILED"; DETAIL="server cert does not cover this address - set tls-server-name on env '$CENV' to a name in the cert (an IP or a port-forward address is never in the cert)" ;;
       *"unknown authority"*|*"verification failure"*)
         RESULT="AUTH FAILED"; DETAIL="CA rejected the server cert - tls-ca-path on env '$CENV' is wrong or stale (check for a re-issued CA)" ;;
       *"certificate required"*)
