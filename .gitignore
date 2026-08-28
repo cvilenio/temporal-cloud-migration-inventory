@@ -1,3 +1,4 @@
 out/
 *.tsv
 .DS_Store
+.githooks/patterns.local
