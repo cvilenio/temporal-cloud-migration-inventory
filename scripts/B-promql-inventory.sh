@@ -16,7 +16,7 @@
 #   The discovery preamble lists the candidate labels.
 #
 # WRITES: one flat row per namespace on stdout, commentary on stderr.
-#   -> paste into the Raw_PromQL tab, at cell A2
+#   Feed the TSV into your Cloud migration sizing / prerequisite review.
 #
 # COMPATIBILITY: bash 3.2 (stock macOS /bin/bash). Requires: curl, jq, awk.
 # ===========================================================================
@@ -27,7 +27,6 @@ PROM="${PROM_URL:?set PROM_URL, e.g. http://localhost:9090}"
 CLUSTER_ID="${CLUSTER_ID:-UNKNOWN}"
 DAYS="${WINDOW_DAYS:-${DAYS:-30}}"
 STEP="${STEP:-300}"
-TZ_NOTE="${TZ_NOTE:-UTC}"
 MIN_COVERAGE="${MIN_COVERAGE:-20}"
 SKIP_NS="${SKIP_NS:-temporal-system temporal_system}"
 RUN_TS="$(date -u +"%Y-%m-%d %H:%M:%S")"   # timestamp, not date: see script A
@@ -37,6 +36,13 @@ CLUSTER_VALUE="${CLUSTER_VALUE:-}"
 CSEL=""
 if [ -n "$CLUSTER_LABEL" ] && [ -n "$CLUSTER_VALUE" ]; then
   CSEL="$CLUSTER_LABEL=\"$CLUSTER_VALUE\","
+fi
+
+if ! curl -sf --max-time 15 "$PROM/api/v1/query?query=1" >/dev/null 2>&1; then
+  echo "ERROR cannot reach a Prometheus HTTP API at $PROM" >&2
+  echo "      Tried: $PROM/api/v1/query?query=1" >&2
+  echo "      Nothing was written. Check the URL, the port-forward, and any auth proxy." >&2
+  exit 1
 fi
 
 now=$(date +%s)
@@ -239,7 +245,7 @@ RQ="sum(rate(service_requests{$LOAD_OP}[5m])) by ($NSLABEL)[${DAYS}d:5m]"
 
 cat >&2 <<MSG
 
-Paste into the Raw_PromQL tab: select rows 2-2000, delete, click A2, paste.
+Feed this TSV into your Cloud migration sizing / prerequisite review.
 
   p50, p95 and actions_per_day are BLANK below ${MIN_COVERAGE}% window coverage.
   Blank means "not computed"; a number is always a measurement, and 0 means
@@ -247,12 +253,16 @@ Paste into the Raw_PromQL tab: select rows 2-2000, delete, click A2, paste.
   suppressed rate would be indistinguishable from a namespace with no traffic.
 
   new_executions counts StartWorkflowExecution only. Compare it against
-  visible_executions from script A: they should be close. A large gap means
+  visible_executions from script A - but ONLY when this run's effective window is
+  at least as long as that namespace's retention_days. Script A reports what
+  visibility currently holds; this script reports flow over a lookback. If the
+  lookback is shorter, a gap is arithmetic, not a finding. When the windows do
+  line up, a large gap means
   retries, failed starts, or workflow-ID reuse, and it makes actions_per_execution
   understate by that factor.
 
   peak_confidence carries the artifact flag. A window is only a real pattern if
   several distinct days reached peak magnitude.
 
-  Keep WINDOW_DAYS identical between this script and script A.
+  WINDOW_DAYS applies to this script only. Script A has no time window.
 MSG

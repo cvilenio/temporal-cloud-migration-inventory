@@ -16,9 +16,10 @@
 #   TEMPORAL_ENV is a profile from `temporal env list`, so each cluster can
 #   authenticate however it likes without this script knowing.
 #
-# WRITES (append, so partial runs accumulate)
-#   $OUT/clusters.tsv     -> paste into the Raw_CLI_Clusters tab, at cell A2
-#   $OUT/namespaces.tsv   -> paste into the Raw_CLI_Namespaces tab, at cell A2
+# WRITES (merge by key, so partial runs accumulate and re-runs refresh)
+#   $OUT/clusters.tsv
+#   $OUT/namespaces.tsv
+#   Feed these into whatever review process you use for Cloud migration sizing.
 #
 # SCALE
 #   --resume              skip namespaces already in namespaces.tsv. Makes the
@@ -64,12 +65,11 @@ done
 case "$PARALLEL" in ''|*[!0-9]*) echo "--parallel needs a number" >&2; exit 2 ;; esac
 [ "$PARALLEL" -lt 1 ] && PARALLEL=1
 
-WINDOW_DAYS="${WINDOW_DAYS:-30}"      # keep identical to script B
 SAMPLE="${SAMPLE:-200}"               # closed executions sampled per namespace
 SKIP_NAMESPACES="${SKIP_NAMESPACES:-temporal-system}"
 # Full timestamp, not a date: both scripts run on the same day, so day
 # granularity cannot show that they were hours apart. Space separator and no
-# trailing Z because that is what Google Sheets parses as a datetime.
+# trailing Z so common TSV consumers treat the value as a datetime.
 RUN_TS="$(date -u +"%Y-%m-%d %H:%M:%S")"
 
 mkdir -p "$OUT"
@@ -157,6 +157,15 @@ JQ_OPEN_START='
 do_namespace() {
   CLUSTER_ID="$1"; NS="$2"; THIS_CLUSTER="$3"; OUTF="$4"
     D="$(t operator namespace describe --namespace "$NS" --output json 2>/dev/null || echo '{}')"
+    # Every call below degrades to an empty object on failure, which would make
+    # "cannot read this namespace" indistinguishable from "this namespace is
+    # empty". Decide once, here, and label the row instead of emitting zeros.
+    NS_READABLE=1
+    case "$(jq -r 'if (.namespaceInfo.name // .name // "") == "" then "no" else "yes" end' <<<"$D" 2>/dev/null)" in
+      yes) ;;
+      *) NS_READABLE=0
+         echo "    WARN [$CLUSTER_ID/$NS] namespace describe returned nothing - not counted." >&2 ;;
+    esac
     IS_GLOBAL="$(jq -r '.isGlobalNamespace // .namespaceInfo.isGlobalNamespace // false' <<<"$D")"
     ACTIVE="$(jq -r '.replicationConfig.activeClusterName // ""' <<<"$D")"
     CLUSTERS="$(jq -r '[.replicationConfig.clusters[]?.clusterName] | join(";")' <<<"$D")"
@@ -229,7 +238,7 @@ do_namespace() {
     elif [ "$RUNNING" -gt 0 ]; then
       AGE_D="UNKNOWN ($RUNNING running but list returned none)"
     else
-      AGE_D="0"
+      AGE_D="NONE OPEN"
     fi
 
     printf '%s/%s\t%s\t%s\t%s\t%s\t%s\t%s\t' \
@@ -237,7 +246,7 @@ do_namespace() {
 
     printf '%s\n' "$ROWS" | awk -F'\t' -v vis="$VISIBLE" -v age="$AGE_D" \
         -v sched="$SCHED" -v sac="$SA_COUNT" -v sabt="$SA_BY_TYPE" -v saf="$SA_FLAG" \
-        -v mix="$STATUS_MIX" '
+        -v mix="$STATUS_MIX" -v readable="$NS_READABLE" '
       NF >= 4 {
         n++
         if ($2+0 > maxb) maxb = $2+0
@@ -250,15 +259,18 @@ do_namespace() {
         if (n == 0) {
           # Five tabs, not four: fields 10-13 (gb, max_kb, max_events, avg_kb)
           # are all blank here, and one short shifts every later column left.
-          printf "\t%s\t\t\t\t\t0\t%s\t%d\t%s\t%s\t%s\t%s\tno executions in window\n",
-                 age, sched, vis, mix, sac, sabt, saf
+          printf "\t%s\t\t\t\t\t0\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
+                 age, sched, vis, mix, sac, sabt,
+                 (readable == 0 ? "" : saf),
+                 (readable == 0 ? "NAMESPACE UNREADABLE - values not collected" : "no executions in window")
           exit
         }
         avgb = sumb / n
         gb   = (vis * avgb) / 1073741824
         # A sample that covered every visible execution is not a sample: the
         # maxima are the real ceilings and need no caveat.
-        basis = (n >= vis ? sprintf("%d of %d - FULL POPULATION, maxima exact", n, vis) \
+        basis = (readable == 0 ? "NAMESPACE UNREADABLE - values not collected" \
+                : n >= vis ? sprintf("%d of %d - FULL POPULATION, maxima exact", n, vis) \
                           : sprintf("%d of %d sampled - maxima are lower bounds", n, vis))
         printf "%s\t%s\t%.5f\t%.1f\t%d\t%.1f\t%d\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
                (dn ? sprintf("%.1f", dsum/dn) : ""), age,
@@ -273,6 +285,11 @@ do_cluster() {
   CJ="$(t operator cluster describe --output json 2>/dev/null || echo '{}')"
   THIS_CLUSTER="$(jq -r '.clusterName // .ClusterName // "UNKNOWN"' <<<"$CJ")"
   SERVER_VERSION="$(jq -r '.serverVersion // .ServerVersion // "UNKNOWN"' <<<"$CJ")"
+  # UNKNOWN reads like a value. Say plainly that the cluster was attempted
+  # and could not be reached, so a downstream review does not treat it as data.
+  if [ "$THIS_CLUSTER" = UNKNOWN ]; then
+    THIS_CLUSTER="UNREACHABLE - not collected"; SERVER_VERSION="UNREACHABLE"
+  fi
   # Replace this cluster's row rather than appending a second one, so a re-run
   # refreshes in place and the file stays one row per cluster.
   _cltmp="$(mktemp)"
@@ -280,7 +297,7 @@ do_cluster() {
   printf '%s\t%s\t%s\t%s\n' "$CLUSTER_ID" "$RUN_TS" "$THIS_CLUSTER" "$SERVER_VERSION" >> "$_cltmp"
   mv "$_cltmp" "$CL_OUT"
 
-  if [ "$THIS_CLUSTER" = UNKNOWN ]; then
+  if [ "$SERVER_VERSION" = UNREACHABLE ]; then
     echo "  WARN [$CLUSTER_ID] cluster describe returned nothing - connection may be failing." >&2
     echo "       Replication role cannot be computed without the cluster's own name." >&2
   fi
@@ -363,11 +380,11 @@ MSG
     fi
   done
   wait
-  [ "$PARALLEL" -gt 1 ] && echo "    $RAN/${#NS_LIST[@]} done" >&2
+  [ "$PARALLEL" -gt 1 ] && [ $((RAN % PARALLEL)) -ne 0 ] && echo "    $RAN/${#NS_LIST[@]} done" >&2
   # Merge by row_key rather than blind append. A namespace collected again
   # replaces its previous row, so re-running without --resume genuinely
-  # refreshes instead of leaving a stale duplicate that the sheet would match
-  # first. Order is preserved: survivors keep their place, new rows go last.
+  # refreshes instead of leaving a stale duplicate. Order is preserved:
+  # survivors keep their place, new rows go last.
   _new="$(mktemp)"
   cat "$NSTMP"/* > "$_new" 2>/dev/null || true
   if [ -s "$_new" ]; then
@@ -388,7 +405,7 @@ MSG
 
 # ---------------------------------------------------------------------------
 echo "script=A-cli-inventory.sh version=$SCRIPT_VERSION" >&2
-echo "run_ts=$RUN_TS UTC  window=${WINDOW_DAYS}d  sample=$SAMPLE" >&2
+echo "run_ts=$RUN_TS UTC  sample=$SAMPLE" >&2
 
 if [ -n "$CLUSTERS_FILE" ]; then
   [ -r "$CLUSTERS_FILE" ] || { echo "cannot read $CLUSTERS_FILE" >&2; exit 2; }
@@ -418,7 +435,7 @@ DUPES="$(awk -F'\t' 'NR>1 && $2!="" && $4!="" {print $2"\t"$4}' "$NS_OUT" \
 {
   echo
   echo "wrote $CL_OUT and $NS_OUT"
-  echo "  Paste each into its Raw_ tab: select rows 2-2000, delete, click A2, paste."
+  echo "  Feed these into your Cloud migration sizing / prerequisite review."
   echo
   if [ -n "$DUPES" ]; then
     echo "DUPLICATE NAMESPACE NAMES ACROSS CLUSTERS:"
@@ -446,5 +463,9 @@ DUPES="$(awk -F'\t' 'NR>1 && $2!="" && $4!="" {print $2"\t"$4}' "$NS_OUT" \
   echo "Keyword 40, Text 5, KeywordList 5, others 20 - so 8 Text fails while a"
   echo "count of 8 looks harmless. sa_limit_check does that comparison."
   echo
-  echo "Keep WINDOW_DAYS identical between this script and script B."
+  echo "This script reports CURRENT STATE, not a time window: visible_executions"
+  echo "is whatever visibility still holds, bounded by each namespace's own"
+  echo "retention_days. Script B reports FLOW over a lookback window. Compare the"
+  echo "two only when B's effective window is at least as long as retention_days;"
+  echo "otherwise a gap between them is expected and means nothing."
 } >&2

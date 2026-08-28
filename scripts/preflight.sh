@@ -3,7 +3,11 @@
 # "cannot connect" and "connected but rejected" need different fixes.
 set -uo pipefail
 SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.0}"
+case "${1:-}" in
+  -h|--help) sed -n '2,3p' "$0"; echo "usage: $0 [clusters.conf]"; exit 0 ;;
+esac
 CONF="${1:-clusters.conf}"
+[ -r "$CONF" ] || { echo "cannot read $CONF" >&2; exit 2; }
 echo "preflight.sh version=$SCRIPT_VERSION" >&2
 printf 'cluster_id\tenv\tresult\tdetail\n'
 PF_TMP="$(mktemp)"
@@ -12,14 +16,21 @@ trap 'rm -f "$PF_TMP"' EXIT
 while IFS=$'\t' read -r CID CENV _rest || [ -n "${CID:-}" ]; do
   case "${CID:-}" in ''|\#*) CID=""; continue ;; esac
   CENV="$(printf '%s' "${CENV:-}" | tr -d ' \r')"
+  [ -z "$CENV" ] && { printf '%s\t\tSKIPPED\tno TEMPORAL_ENV in %s - needs a real tab between the columns\n' "$CID" "$CONF"; CID=""; continue; }
   ERR="$(temporal --env "$CENV" operator cluster describe --output json 2>&1 >"$PF_TMP" || true)"
   NAME="$(jq -r '.clusterName // empty' <"$PF_TMP" 2>/dev/null)"
   if [ -n "$NAME" ]; then
     RESULT="OK"; DETAIL="$NAME"
   else
     case "$ERR" in
-      *"certificate required"*|*"tls:"*|*"x509"*)
-        RESULT="AUTH FAILED"; DETAIL="server wants mTLS - add tls-cert-path, tls-key-path, tls-ca-path to env '$CENV'" ;;
+      *"certificate is valid for"*)
+        RESULT="AUTH FAILED"; DETAIL="server cert does not cover this address - set tls-server-name on env '$CENV' to a name in the cert" ;;
+      *"unknown authority"*|*"verification failure"*)
+        RESULT="AUTH FAILED"; DETAIL="CA rejected the server cert - tls-ca-path on env '$CENV' is wrong or stale (check for a re-issued CA)" ;;
+      *"certificate required"*)
+        RESULT="AUTH FAILED"; DETAIL="server wants a client certificate - add tls-cert-path and tls-key-path to env '$CENV'" ;;
+      *"tls:"*|*"x509"*)
+        RESULT="AUTH FAILED"; DETAIL="TLS handshake failed - $(printf '%s' "$ERR" | tr '\n' ' ' | cut -c1-90)" ;;
       *"connection refused"*)
         RESULT="UNREACHABLE"; DETAIL="nothing listening - check the address or start the port-forward" ;;
       *"server preface"*)

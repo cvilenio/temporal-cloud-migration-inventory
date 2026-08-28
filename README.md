@@ -12,7 +12,7 @@ They exist because that data is spread across the Temporal CLI and a Prometheus-
 | `scripts/A-cli-inventory.sh` | Temporal CLI, every cluster in `clusters.conf` | `clusters.tsv`, `namespaces.tsv` |
 | `scripts/B-promql-inventory.sh` | Prometheus HTTP API, every cluster that instance scrapes | `promql.tsv` |
 
-The TSV files are designed to be pasted into a companion inventory spreadsheet, but they are ordinary tab-separated files and are useful on their own.
+The TSV files feed the sizing and prerequisite checks in a Cloud migration. They are ordinary tab-separated files, so any downstream review process can consume them.
 
 ## They are read-only
 
@@ -40,6 +40,12 @@ temporal env set --env prod-us-east --key tls-key-path  --value /secrets/us-east
 temporal env set --env prod-us-east --key tls-ca-path   --value /secrets/us-east/ca.pem
 ```
 
+Add `tls-server-name` whenever the address you connect to is not a name in the server certificate. Any port-forward, IP literal, or load-balancer hostname needs it, and the handshake fails without it. Set it to a name that appears on the certificate (often the same DNS name you would have used as `address` without the port-forward).
+
+```
+temporal env set --env prod-us-east --key tls-server-name --value <name-on-server-cert>
+```
+
 Map each cluster to a stable ID by copying `clusters.conf.example`. Columns are separated by a real tab. The ID becomes the join key in the output, so pick something durable.
 
 Then:
@@ -60,27 +66,32 @@ Script A takes flags:
 | `--out DIR` | Output directory. Defaults to `./out`. | |
 | `--resume` | Skips namespaces whose row key is already in `namespaces.tsv`. | Saves the work, so already-collected rows keep their original data. Omit it to refresh. |
 | `--parallel N` | N namespaces at a time, default 1. Wall clock falls roughly linearly. | Peak visibility load rises by the same factor. |
-| `--skip-oldest-open` | Drops the most expensive call, which pages up to 1000 open executions. | Loses the `oldest_open_execution_days` column. |
+| `--skip-oldest-open` | Drops the most expensive call, which pages up to 1000 open executions. | The `oldest_open_execution_days` column is still emitted, carrying a `SKIPPED` marker instead of a number. |
 
 Both scripts take environment variables:
 
 | Variable | Applies to | Meaning |
 | :- | :- | :- |
-| `WINDOW_DAYS` | A and B | Metrics window in days, default 30. Keep identical between the two scripts. |
+| `WINDOW_DAYS` (alias `DAYS`) | B | Metrics lookback in days, default 30. Script A has no time window, so there is nothing to keep in sync. |
 | `SAMPLE` | A | Closed executions sampled per namespace for history statistics, default 200. |
 | `NAMESPACES` | A | Space-separated list. Skips discovery. Applies to every cluster in the run. |
-| `SKIP_NAMESPACES` | A | Namespaces to exclude, default `temporal-system`. |
+| `SKIP_NAMESPACES` | A | Namespaces to exclude during discovery, default `temporal-system`. Setting it empty does not clear it; pass a name that matches nothing. |
 | `CLUSTER_ID`, `TEMPORAL_ADDRESS` | A | Single-cluster mode, used instead of `--clusters`. |
+| `TEMPORAL_TLS_CERT`, `TEMPORAL_TLS_KEY`, `TEMPORAL_TLS_CA` | A | TLS paths for single-cluster mode. This mode cannot express `tls-server-name`, `api-key`, `client-authority` or `codec-endpoint`, so use a profile when you need any of those. |
+| `PARALLEL` | A | Same as `--parallel`. |
 | `PROM_URL` | B | Prometheus HTTP API base URL. Required. |
 | `CLUSTER_ID` | B | Cluster ID to stamp on each row. |
 | `CLUSTER_LABEL`, `CLUSTER_VALUE` | B | Disambiguate a namespace name that exists on more than one cluster. |
-| `PROM_JOB` | B | Pin a scrape job when several duplicate the same targets. |
+| `PROM_JOB` | B | Pin a scrape job when several duplicate the same targets. Ignored when only one job exists. |
+| `SKIP_NS` | B | Namespaces to exclude, default `temporal-system temporal_system`. |
 | `MIN_COVERAGE` | B | Coverage floor below which rate columns are suppressed, default 20. |
-| `STEP` | B | Range query step in seconds, default 300. |
+| `STEP` | B | Step for the peak-shape range query, in seconds, default 300. The window and coverage queries are fixed at hourly resolution. |
 
 ## Cost of a run
 
-Script A makes 6 CLI calls per namespace, sequentially. Each call is a separate `temporal` process, so round-trip time to the frontend dominates. After its first namespace the script extrapolates and prints an estimate for the rest of the cluster, so a long run announces its own cost while there is still time to stop it.
+Script A makes 6 CLI calls per namespace, sequentially, plus 3 per cluster for the cluster describe, the namespace list and the visibility probe. Each call is a separate `temporal` process, so round-trip time to the frontend dominates.
+
+After its first namespace the script extrapolates and prints an estimate for the rest of the cluster. It has nothing to extrapolate from on a single-namespace cluster, and it does not print an estimate under `--parallel`, so trial on a cluster with several namespaces if you want the number.
 
 Frontend load is not a concern at these rates. The visibility store is the constraint that matters, and it depends which one you run. Script A prints which store it found.
 
@@ -97,7 +108,7 @@ There is no batch flag. The scope of a run is whatever is in the file you point 
 
 Output files accumulate across runs, and headers are written only when a file is new. Every namespace row is keyed on cluster ID plus namespace name, and every cluster row on cluster ID, so runs against different conf files build up in the same TSVs.
 
-Rows merge by key rather than being blindly appended. Collecting a namespace again replaces its previous row, so the file holds exactly one current row per key no matter how many runs produced it. That makes a re-run a genuine refresh, and means the files are always safe to paste over a sheet's paste zone wholesale.
+Rows merge by key rather than being blindly appended. Collecting a namespace again replaces its previous row, so the file holds exactly one current row per key no matter how many runs produced it. A re-run is a genuine refresh, and a full file replace is always a coherent snapshot.
 
 `--resume` tracks progress rather than scope. It builds its skip list from the row keys already in `namespaces.tsv`, so it covers everything collected so far, not just the conf file being run. Use it to continue an interrupted run; omit it to re-collect and refresh.
 
@@ -105,7 +116,11 @@ Rows merge by key rather than being blindly appended. Collecting a namespace aga
 
 `sample_basis` says whether the history maxima are exact. `FULL POPULATION` means the sample covered every visible execution.
 
-A blank cell is not a zero. A number is always a measurement, a blank means not computed, and zero means genuinely zero. Script B suppresses rate columns below the coverage floor rather than reporting a misleading zero; `coverage_pct` says why.
+A blank cell is not a zero. A number is always a measurement, a blank means not computed, and zero means genuinely zero. Script B suppresses rate columns below the coverage floor rather than reporting a misleading zero; `coverage_pct` says why. Script A uses text markers for the same reason: `NONE OPEN`, `SKIPPED (--skip-oldest-open)`, and `NAMESPACE UNREADABLE` all say why a number is absent.
+
+`history_bytes_gb` is an estimate, not a measurement. It is the visible execution count multiplied by the mean history size of the sampled executions, so its accuracy depends entirely on `sample_basis` on the same row. `FULL POPULATION` means it is exact; anything else means it is extrapolated from `SAMPLE` executions, and raising `SAMPLE` tightens it.
+
+**Do not compare script A's `visible_executions` against script B's `new_executions` unless the windows line up.** Script A reports what visibility currently holds, bounded by each namespace's own `retention_days`. Script B reports flow over its lookback. If the lookback is shorter than the retention, a gap between the two is arithmetic rather than a finding. When they do line up, a large gap points at retries, failed starts, or workflow-ID reuse.
 
 Duplicate scrape jobs multiply every absolute number while leaving every ratio correct. Script B detects this and reports it in the stderr preamble.
 
@@ -114,6 +129,8 @@ Search attribute limits on Cloud are per type, so a comfortable-looking total ca
 ## Versioning
 
 Each script prints its version to stderr on every run. Pin to a tagged release rather than to the default branch, and record the version alongside any data you collect.
+
+The version is a string in the script, so a locally modified copy still reports the tag it was cut from. If you change a script, change `SCRIPT_VERSION` too.
 
 ## License
 
