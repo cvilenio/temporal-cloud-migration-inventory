@@ -2,13 +2,13 @@
 # Preflight every cluster in clusters.conf. Classifies the failure, because
 # "cannot connect" and "connected but rejected" need different fixes.
 set -uo pipefail
-SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.1}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.2}"
+echo "preflight.sh version=$SCRIPT_VERSION" >&2
 case "${1:-}" in
   -h|--help) sed -n '2,3p' "$0"; echo "usage: $0 [clusters.conf]"; exit 0 ;;
 esac
 CONF="${1:-clusters.conf}"
 [ -r "$CONF" ] || { echo "cannot read $CONF" >&2; exit 2; }
-echo "preflight.sh version=$SCRIPT_VERSION" >&2
 printf 'cluster_id\tenv\tresult\tdetail\n'
 PF_TMP="$(mktemp)"
 trap 'rm -f "$PF_TMP"' EXIT
@@ -16,7 +16,14 @@ trap 'rm -f "$PF_TMP"' EXIT
 while IFS=$'\t' read -r CID CENV _rest || [ -n "${CID:-}" ]; do
   case "${CID:-}" in ''|\#*) CID=""; continue ;; esac
   CENV="$(printf '%s' "${CENV:-}" | tr -d ' \r')"
-  [ -z "$CENV" ] && { printf '%s\t\tSKIPPED\tno TEMPORAL_ENV in %s - needs a real tab between the columns\n' "$CID" "$CONF"; CID=""; continue; }
+  if [ -z "$CENV" ]; then
+    # $CID holds the whole raw line when the columns were space-separated, so
+    # emit a safe first field and put the raw text in the detail column.
+    _first="$(printf '%s' "$CID" | awk '{print $1}')"
+    printf '%s\t\tSKIPPED\tno TEMPORAL_ENV in %s - needs a real tab between the columns; line was: %s\n' \
+      "$_first" "$CONF" "$(printf '%s' "$CID" | tr '\t' ' ')"
+    CID=""; continue
+  fi
   ERR="$(temporal --env "$CENV" operator cluster describe --output json 2>&1 >"$PF_TMP" || true)"
   NAME="$(jq -r '.clusterName // empty' <"$PF_TMP" 2>/dev/null)"
   if [ -n "$NAME" ]; then

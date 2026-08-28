@@ -21,11 +21,16 @@
 # COMPATIBILITY: bash 3.2 (stock macOS /bin/bash). Requires: curl, jq, awk.
 # ===========================================================================
 set -uo pipefail
-SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.1}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.2}"
 
 echo "# script=B-promql-inventory.sh version=$SCRIPT_VERSION" >&2
 PROM="${PROM_URL:?set PROM_URL, e.g. http://localhost:9090}"
 CLUSTER_ID="${CLUSTER_ID:-UNKNOWN}"
+if [ "$CLUSTER_ID" = UNKNOWN ]; then
+  echo "WARN CLUSTER_ID is not set. Every row will be keyed UNKNOWN/<namespace> and" >&2
+  echo "     will not join to anything. Set CLUSTER_ID to the same value you used" >&2
+  echo "     for this cluster in script A." >&2
+fi
 DAYS="${WINDOW_DAYS:-${DAYS:-30}}"
 # Whole days, at least 1. A zero divides by zero downstream and emits a
 # fabricated actions_per_day; a fraction leaves `start` unset and every query
@@ -51,6 +56,23 @@ if ! curl -sf --max-time 15 "$PROM/api/v1/query?query=1" >/dev/null 2>&1; then
   echo "      Tried: $PROM/api/v1/query?query=1" >&2
   echo "      Nothing was written. Check the URL, the port-forward, and any auth proxy." >&2
   exit 1
+fi
+
+_probe_metric() {
+  curl -sf --max-time 20 -G --data-urlencode "query=count($1)" "$PROM/api/v1/query" 2>/dev/null \
+    | jq -e '.data.result | length > 0' >/dev/null 2>&1
+}
+SR="service_requests"; ACT="action"
+if ! _probe_metric "$SR"; then
+  if _probe_metric "${SR}_total"; then
+    SR="service_requests_total"; ACT="action_total"
+    echo "# note: this store uses the _total suffix; using $SR and $ACT" >&2
+  else
+    echo "ERROR neither 'service_requests' nor 'service_requests_total' returned any series at $PROM" >&2
+    echo "      Temporal SERVER metrics do not appear to be scraped here. SDK-only metrics" >&2
+    echo "      cannot fill any load column. Nothing was written." >&2
+    exit 1
+  fi
 fi
 
 now=$(date +%s)
@@ -88,7 +110,7 @@ echo "# run_ts=$RUN_TS UTC  cluster_id=$CLUSTER_ID  window=${DAYS}d  step=${STEP
 
 # --- which label carries the namespace
 NSLABEL="namespace"
-probe="$(curl -sG --data-urlencode 'query=group by (namespace, exported_namespace) (service_requests)' \
+probe="$(curl -sG --data-urlencode "query=group by (namespace, exported_namespace) (${SR})" \
   "$PROM/api/v1/query" | jq -r '[.data.result[]?.metric | keys[]] | unique | join(",")')"
 case "$probe" in
   *exported_namespace*) NSLABEL="exported_namespace" ;;
@@ -99,13 +121,13 @@ echo "# namespace label: $NSLABEL"
 
 # --- candidate cluster discriminators, so a human can pick one
 echo "# candidate cluster-discriminating labels:"
-curl -sG --data-urlencode "match[]=service_requests{service_name=\"frontend\"}" \
+curl -sG --data-urlencode "match[]=${SR}{service_name=\"frontend\"}" \
     --data-urlencode "start=$start" --data-urlencode "end=$now" \
     "$PROM/api/v1/series" 2>/dev/null \
   | jq -r '[.data[]? | keys[]] | unique[]' 2>/dev/null \
   | grep -vE '^(__name__|namespace|exported_namespace|operation|service_name|type)$' \
   | while IFS= read -r lab; do
-      vals="$(curl -sG --data-urlencode "query=group by ($lab) (service_requests{service_name=\"frontend\"})" \
+      vals="$(curl -sG --data-urlencode "query=group by ($lab) (${SR}{service_name=\"frontend\"})" \
         "$PROM/api/v1/query" | jq -r --arg l "$lab" '[.data.result[]?.metric[$l]] | unique | join(", ")')"
       n="$(printf '%s' "$vals" | awk -F', ' '{print NF}')"
       echo "#   $lab  ($n): $vals" | cut -c1-160
@@ -113,7 +135,7 @@ curl -sG --data-urlencode "match[]=service_requests{service_name=\"frontend\"}" 
 
 # --- scrape duplication: identical series under several jobs
 FRONTEND="service_name=\"frontend\""
-JOBS="$(curl -sG --data-urlencode "query=count by (job) (service_requests{$FRONTEND})" \
+JOBS="$(curl -sG --data-urlencode "query=count by (job) (${SR}{$FRONTEND})" \
   "$PROM/api/v1/query" 2>/dev/null | jq -r '.data.result[]? | "\(.metric.job) \(.value[1])"')"
 NJOBS="$(printf '%s\n' "$JOBS" | grep -c . || true)"
 JOB_SEL=""
@@ -126,7 +148,7 @@ if [ "${NJOBS:-0}" -gt 1 ]; then
   printf '%s\n' "$JOBS" | sed 's/^/#     job=/'
   echo "#   Override with PROM_JOB. If your jobs PARTITION targets rather than"
   echo "#   duplicating them, this drops data - check:"
-  echo "#     count by (job, instance) (service_requests{$FRONTEND})"
+  echo "#     count by (job, instance) (${SR}{$FRONTEND})"
 else
   echo "# scrape jobs: ${NJOBS:-0} - no duplication"
 fi
@@ -147,27 +169,27 @@ LOAD_OP="${FRONTEND},operation=~\"StartWorkflowExecution|SignalWithStartWorkflow
 NEWX_OP="${FRONTEND},operation=\"StartWorkflowExecution\""
 SWS_OP="${FRONTEND},operation=\"SignalWithStartWorkflowExecution\""
 
-RQ="sum(rate(service_requests{$LOAD_OP}[5m])) by ($NSLABEL)[${DAYS}d:5m]"
+RQ="sum(rate(${SR}{$LOAD_OP}[5m])) by ($NSLABEL)[${DAYS}d:5m]"
 
 # =============================================== gather into one tagged stream
 {
-  win "service_requests{$LOAD_OP}" | awk -F'\t' -v d="$DAYS" '{
+  win "${SR}{$LOAD_OP}" | awk -F'\t' -v d="$DAYS" '{
       printf "WIN\t%s\t%.1f\t%.0f\n", $1, ($3-$2)/86400, ($4/(d*24))*100 }'
-  win "action{$FRONTEND}"          | awk -F'\t' '{ printf "AWIN\t%s\t%.1f\n", $1, ($3-$2)/86400 }'
+  win "${ACT}{$FRONTEND}"          | awk -F'\t' '{ printf "AWIN\t%s\t%.1f\n", $1, ($3-$2)/86400 }'
 
   pq "quantile_over_time(0.5,  $RQ)"                                        | sed 's/^/P50\t/'
   pq "quantile_over_time(0.95, $RQ)"                                        | sed 's/^/P95\t/'
   pq "max_over_time($RQ)"                                                   | sed 's/^/MAX\t/'
-  pq "sum(increase(action{$FRONTEND}[${DAYS}d])) by ($NSLABEL)"             | sed 's/^/ACT\t/'
-  pq "sum(increase(service_requests{$NEWX_OP}[${DAYS}d])) by ($NSLABEL)"    | sed 's/^/NEWX\t/'
-  pq "sum(increase(service_requests{$SWS_OP}[${DAYS}d])) by ($NSLABEL)"     | sed 's/^/SWS\t/'
+  pq "sum(increase(${ACT}{$FRONTEND}[${DAYS}d])) by ($NSLABEL)"             | sed 's/^/ACT\t/'
+  pq "sum(increase(${SR}{$NEWX_OP}[${DAYS}d])) by ($NSLABEL)"    | sed 's/^/NEWX\t/'
+  pq "sum(increase(${SR}{$SWS_OP}[${DAYS}d])) by ($NSLABEL)"     | sed 's/^/SWS\t/'
 
   # peak shape: one range query per namespace, bucketed by hour-of-day
-  for NS in $(pq "sum(rate(service_requests{$LOAD_OP}[5m])) by ($NSLABEL)" | awk '{print $1}' | sort -u); do
+  for NS in $(pq "sum(rate(${SR}{$LOAD_OP}[5m])) by ($NSLABEL)" | awk '{print $1}' | sort -u); do
     [ "$NS" = "_none_" ] && continue
     skip_ns "$NS" && continue
     SERIES="$(curl -sG \
-        --data-urlencode "query=sum(rate(service_requests{$LOAD_OP,$NSLABEL=\"$NS\"}[5m]))" \
+        --data-urlencode "query=sum(rate(${SR}{$LOAD_OP,$NSLABEL=\"$NS\"}[5m]))" \
         --data-urlencode "start=$start" --data-urlencode "end=$now" \
         --data-urlencode "step=$STEP" \
         "$PROM/api/v1/query_range" \

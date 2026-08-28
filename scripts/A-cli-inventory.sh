@@ -44,7 +44,8 @@
 # COMPATIBILITY: bash 3.2 (stock macOS /bin/bash). Requires: temporal CLI, jq.
 # ===========================================================================
 set -uo pipefail
-SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.1}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.2}"
+echo "script=A-cli-inventory.sh version=$SCRIPT_VERSION" >&2
 
 CLUSTERS_FILE=""
 OUT="./out"
@@ -67,11 +68,14 @@ case "$PARALLEL" in ''|*[!0-9]*) echo "--parallel needs a number" >&2; exit 2 ;;
 
 SAMPLE="${SAMPLE:-200}"               # closed executions sampled per namespace
 SKIP_NAMESPACES="${SKIP_NAMESPACES:-temporal-system}"
+OPEN_PAGE="${OPEN_PAGE:-1000}"  # open executions paged for the oldest-open column
 # Full timestamp, not a date: both scripts run on the same day, so day
 # granularity cannot show that they were hours apart. Space separator and no
 # trailing Z so common TSV consumers treat the value as a datetime.
 RUN_TS="$(date -u +"%Y-%m-%d %H:%M:%S")"
 
+# mktemp files are 0600; restore the umask-implied mode after each replace.
+OUT_MODE="$(printf '%o' $(( 0666 & ~$(umask) )) )"
 mkdir -p "$OUT"
 CL_OUT="$OUT/clusters.tsv"
 NS_OUT="$OUT/namespaces.tsv"
@@ -222,20 +226,27 @@ do_namespace() {
 
     ROWS="$(t workflow list --namespace "$NS" --limit "$SAMPLE" --output json 2>/dev/null \
             | jq -r "$JQ_ROWS" 2>/dev/null)"
+    # A namespace we could not describe must not report history numbers either,
+    # or a row carries measurements and NAMESPACE UNREADABLE at the same time.
+    [ "$NS_READABLE" = 0 ] && ROWS=""
 
-    # The most expensive call here: pages up to 1000 open executions because
-    # visibility will not sort, so the oldest can only be found by reading them
-    # all. --skip-oldest-open drops it and costs exactly one column.
+    # The most expensive call here: pages up to OPEN_PAGE open executions.
+    # Standard SQL visibility rejects ORDER BY, so the oldest can only be found
+    # by reading them all; above the page size the answer is a lower bound and
+    # the column says so rather than printing a number that looks measured.
+    # --skip-oldest-open drops the call entirely.
     if [ "$SKIP_OLDEST" = 1 ]; then
       OLDEST=""
     else
-      OLDEST="$(t workflow list --namespace "$NS" --limit 1000 \
+      OLDEST="$(t workflow list --namespace "$NS" --limit "$OPEN_PAGE" \
                   --query 'ExecutionStatus="Running"' --output json 2>/dev/null \
                 | jq -r "$JQ_OPEN_START" 2>/dev/null | sort -n | head -1)"
     fi
     NOW=$(date +%s)
     if [ "$SKIP_OLDEST" = 1 ]; then
       AGE_D="SKIPPED (--skip-oldest-open)"
+    elif [ -n "$OLDEST" ] && [ "${RUNNING:-0}" -gt "$OPEN_PAGE" ]; then
+      AGE_D="AT LEAST $(awk -v n="$NOW" -v o="$OLDEST" 'BEGIN{printf "%.2f",(n-o)/86400}') ($RUNNING running, only $OPEN_PAGE read)"
     elif [ -n "$OLDEST" ]; then
       AGE_D="$(awk -v n="$NOW" -v o="$OLDEST" 'BEGIN{printf "%.2f",(n-o)/86400}')"
     elif [ "$RUNNING" -gt 0 ]; then
@@ -274,7 +285,7 @@ do_namespace() {
                  (readable == 0 ? "" : sac),
                  (readable == 0 ? "" : sabt),
                  (readable == 0 ? "" : saf),
-                 (readable == 0 ? "NAMESPACE UNREADABLE - values not collected" : "no executions in window")
+                 (readable == 0 ? "NAMESPACE UNREADABLE - values not collected" : "no executions found")
           exit
         }
         avgb = sumb / n
@@ -307,7 +318,7 @@ do_cluster() {
   _cltmp="$(mktemp)"
   awk -F'\t' -v cid="$CLUSTER_ID" 'FNR==1 {print; next} $1!=cid {print}' "$CL_OUT" > "$_cltmp"
   printf '%s\t%s\t%s\t%s\n' "$CLUSTER_ID" "$RUN_TS" "$THIS_CLUSTER" "$SERVER_VERSION" >> "$_cltmp"
-  mv "$_cltmp" "$CL_OUT"
+  mv "$_cltmp" "$CL_OUT"; chmod "$OUT_MODE" "$CL_OUT" 2>/dev/null || true
 
   if [ "$SERVER_VERSION" = UNREACHABLE ]; then
     echo "  WARN [$CLUSTER_ID] cluster describe returned nothing - connection may be failing." >&2
@@ -406,7 +417,7 @@ MSG
       !($1 in k) { print }
     ' "$_new" "$NS_OUT" > "$_merged"
     cat "$_new" >> "$_merged"
-    mv "$_merged" "$NS_OUT"
+    mv "$_merged" "$NS_OUT"; chmod "$OUT_MODE" "$NS_OUT" 2>/dev/null || true
   fi
   rm -f "$_new"
   rm -rf "$NSTMP"
@@ -415,7 +426,6 @@ MSG
 }
 
 # ---------------------------------------------------------------------------
-echo "script=A-cli-inventory.sh version=$SCRIPT_VERSION" >&2
 echo "run_ts=$RUN_TS UTC  sample=$SAMPLE" >&2
 
 if [ -n "$CLUSTERS_FILE" ]; then

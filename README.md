@@ -10,13 +10,15 @@ They exist because that data is spread across the Temporal CLI and a Prometheus-
 | :- | :- | :- |
 | `scripts/preflight.sh` | Temporal CLI, connectivity only | terminal output |
 | `scripts/A-cli-inventory.sh` | Temporal CLI, every cluster in `clusters.conf` | `clusters.tsv`, `namespaces.tsv` |
-| `scripts/B-promql-inventory.sh` | Prometheus HTTP API, every cluster that instance scrapes | `promql.tsv` |
+| `scripts/B-promql-inventory.sh` | Prometheus HTTP API, one cluster per run | `promql.tsv` |
 
 The TSV files feed the sizing and prerequisite checks in a Cloud migration. They are ordinary tab-separated files, so any downstream review process can consume them.
 
+If you were pointed here by a migration inventory spreadsheet and its instructions document, those explain what to do with the output. This README covers the scripts themselves.
+
 ## They are read-only
 
-Script A issues describe, count and list calls. Script B issues HTTP range and instant queries. Neither writes to a cluster, a namespace, or a metrics store.
+Script A issues describe, count and list calls. Script B issues only HTTP GETs, against `/api/v1/query`, `/api/v1/query_range`, `/api/v1/series` and `/api/v1/status/flags`. Neither writes to a cluster, a namespace, or a metrics store.
 
 Nothing is transmitted anywhere. All three write to local files or to your terminal.
 
@@ -53,7 +55,7 @@ Then:
 ```
 ./scripts/preflight.sh clusters.conf
 ./scripts/A-cli-inventory.sh --clusters clusters.conf --out ./out
-PROM_URL=http://prometheus.internal:9090 ./scripts/B-promql-inventory.sh > out/promql.tsv 2> out/promql-notes.txt
+PROM_URL=http://prometheus.internal:9090 CLUSTER_ID=prod-us-east-1 ./scripts/B-promql-inventory.sh > out/promql.tsv 2> out/promql-notes.txt
 ```
 
 ## Options
@@ -65,7 +67,7 @@ Script A takes flags:
 | `--clusters FILE` | Cluster list to walk. Scope of a run is whatever is in this file. | |
 | `--out DIR` | Output directory. Defaults to `./out`. | |
 | `--resume` | Skips namespaces whose row key is already in `namespaces.tsv`. | Saves the work, so already-collected rows keep their original data. Omit it to refresh. |
-| `--parallel N` | N namespaces at a time, default 1. Wall clock falls roughly linearly. | Peak visibility load rises by the same factor. |
+| `--parallel N` | N namespaces at a time, default 1. Wall clock falls roughly linearly. | Peak visibility load rises by the same factor. Suppresses the runtime estimate and switches progress to a running count. |
 | `--skip-oldest-open` | Drops the most expensive call, which pages up to 1000 open executions. | The `oldest_open_execution_days` column is still emitted, carrying a `SKIPPED` marker instead of a number. |
 
 Both scripts take environment variables:
@@ -73,23 +75,24 @@ Both scripts take environment variables:
 | Variable | Applies to | Meaning |
 | :- | :- | :- |
 | `WINDOW_DAYS` (alias `DAYS`) | B | Metrics lookback in days, default 30. Script A has no time window, so there is nothing to keep in sync. |
-| `SAMPLE` | A | Closed executions sampled per namespace for history statistics, default 200. |
-| `NAMESPACES` | A | Space-separated list. Skips discovery. Applies to every cluster in the run. |
+| `SAMPLE` | A | Executions sampled per namespace for history statistics, default 200. No status filter, so open executions are included and their partial histories pull the mean down. |
+| `NAMESPACES` | A | Space-separated list. Skips discovery, applies to every cluster in the run, and bypasses the `SKIP_NAMESPACES` exclusion. Do not repeat a name. |
 | `SKIP_NAMESPACES` | A | Namespaces to exclude during discovery, default `temporal-system`. Setting it empty does not clear it; pass a name that matches nothing. |
 | `CLUSTER_ID`, `TEMPORAL_ADDRESS` | A | Single-cluster mode, used instead of `--clusters`. |
 | `TEMPORAL_TLS_CERT`, `TEMPORAL_TLS_KEY`, `TEMPORAL_TLS_CA` | A | TLS paths for single-cluster mode. This mode cannot express `tls-server-name`, `api-key`, `client-authority` or `codec-endpoint`, so use a profile when you need any of those. |
 | `PARALLEL` | A | Same as `--parallel`. |
 | `PROM_URL` | B | Prometheus HTTP API base URL. Required. |
-| `CLUSTER_ID` | B | Cluster ID to stamp on each row. |
+| `CLUSTER_ID` | B | **Required.** Stamped on every row and used as the first half of the row key. Without it every row is keyed `UNKNOWN/<namespace>` and joins to nothing. |
 | `CLUSTER_LABEL`, `CLUSTER_VALUE` | B | Disambiguate a namespace name that exists on more than one cluster. |
 | `PROM_JOB` | B | Pin a scrape job when several duplicate the same targets. Ignored when only one job exists. |
 | `SKIP_NS` | B | Namespaces to exclude, default `temporal-system temporal_system`. |
 | `MIN_COVERAGE` | B | Coverage floor below which rate columns are suppressed, default 20. |
 | `STEP` | B | Step for the peak-shape range query, in seconds, default 300. The window and coverage queries are fixed at hourly resolution. |
+| `OPEN_PAGE` | A | Open executions paged for the oldest-open column, default 1000. |
 
 ## Cost of a run
 
-Script A makes 6 CLI calls per namespace, sequentially, plus 3 per cluster for the cluster describe, the namespace list and the visibility probe. Each call is a separate `temporal` process, so round-trip time to the frontend dominates.
+Script A makes 6 CLI calls per namespace, sequentially, or 5 with `--skip-oldest-open`, plus 3 to 5 per cluster: the cluster describe, the namespace list, and a visibility probe that retries on up to three namespaces. Each call is a separate `temporal` process, so round-trip time to the frontend dominates.
 
 After its first namespace the script extrapolates and prints an estimate for the rest of the cluster. It has nothing to extrapolate from on a single-namespace cluster, and it does not print an estimate under `--parallel`, so trial on a cluster with several namespaces if you want the number.
 
@@ -116,6 +119,8 @@ Rows merge by key rather than being blindly appended. Collecting a namespace aga
 
 `sample_basis` says whether the history maxima are exact. `FULL POPULATION` means the sample covered every visible execution.
 
+`oldest_open_execution_days` pages up to `OPEN_PAGE` (default 1000) running executions. Above that it reports `AT LEAST <days>` together with the running count, because the true oldest cannot be found without reading them all and standard SQL visibility will not sort.
+
 A blank cell is not a zero. A number is always a measurement, a blank means not computed, and zero means genuinely zero. Script B suppresses rate columns below the coverage floor rather than reporting a misleading zero; `coverage_pct` says why. Script A uses text markers for the same reason: `NONE OPEN`, `SKIPPED (--skip-oldest-open)`, and `NAMESPACE UNREADABLE` all say why a number is absent.
 
 `history_bytes_gb` is an estimate, not a measurement. It is the visible execution count multiplied by the mean history size of the sampled executions, so its accuracy depends entirely on `sample_basis` on the same row. `FULL POPULATION` means it is exact; anything else means it is extrapolated from `SAMPLE` executions, and raising `SAMPLE` tightens it.
@@ -128,9 +133,11 @@ Search attribute limits on Cloud are per type, so a comfortable-looking total ca
 
 ## Versioning
 
-Each script prints its version to stderr on every run. Pin to a tagged release rather than to the default branch, and record the version alongside any data you collect.
+Each script prints its version to stderr as its first line, before any argument handling, so even a failed run says what ran.
 
-The version is a string in the script, so a locally modified copy still reports the tag it was cut from. If you change a script, change `SCRIPT_VERSION` too.
+`SCRIPT_VERSION` is a literal in the script and can be overridden from the environment, so the reported version is only trustworthy on an unmodified checkout. If you change a script, change `SCRIPT_VERSION` too.
+
+Pin to a tagged release rather than the default branch. Tags are mutable, so if you need provenance for a review, pin the commit SHA the tag points at.
 
 ## License
 
