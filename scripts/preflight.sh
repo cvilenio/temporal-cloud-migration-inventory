@@ -2,7 +2,7 @@
 # Preflight every cluster in clusters.conf. Classifies the failure, because
 # "cannot connect" and "connected but rejected" need different fixes.
 set -uo pipefail
-SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.2}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.3}"
 echo "preflight.sh version=$SCRIPT_VERSION" >&2
 case "${1:-}" in
   -h|--help) sed -n '2,3p' "$0"; echo "usage: $0 [clusters.conf]"; exit 0 ;;

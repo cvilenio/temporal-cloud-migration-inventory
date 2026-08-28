@@ -44,7 +44,7 @@
 # COMPATIBILITY: bash 3.2 (stock macOS /bin/bash). Requires: temporal CLI, jq.
 # ===========================================================================
 set -uo pipefail
-SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.2}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.3}"
 echo "script=A-cli-inventory.sh version=$SCRIPT_VERSION" >&2
 
 CLUSTERS_FILE=""

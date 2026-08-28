@@ -21,7 +21,7 @@
 # COMPATIBILITY: bash 3.2 (stock macOS /bin/bash). Requires: curl, jq, awk.
 # ===========================================================================
 set -uo pipefail
-SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.2}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-v0.1.3}"
 
 echo "# script=B-promql-inventory.sh version=$SCRIPT_VERSION" >&2
 PROM="${PROM_URL:?set PROM_URL, e.g. http://localhost:9090}"
@@ -260,7 +260,12 @@ RQ="sum(rate(${SR}{$LOAD_OP}[5m])) by ($NSLABEL)[${DAYS}d:5m]"
       else if (cv < mincov)     { perday = 0; suppressed = 1 }
       else                      { perday = (ae>0.04 ? av/ae : 0) }
 
-      apx = (x > 0 ? sprintf("%.2f", av/x) : (av > 0 ? "NO NEW EXECUTIONS - check CAN" : ""))
+      # Below the coverage floor, actions-without-starts is what a short window
+      # looks like, not a continue-as-new pattern. Blank rather than assert a
+      # cause the data cannot support - coverage_pct on the same row says why.
+      if      (x > 0)            apx = sprintf("%.2f", av/x)
+      else if (av > 0 && cv >= mincov) apx = "NO NEW EXECUTIONS - check CAN"
+      else                       apx = ""
 
       print ns"", cid, rd, ns,
             (ef>0?sprintf("%.1f",ef):""), (cv>0?sprintf("%.0f",cv):"0"),

@@ -127,6 +127,8 @@ A blank cell is not a zero. A number is always a measurement, a blank means not 
 
 **Do not compare script A's `visible_executions` against script B's `new_executions` unless the windows line up.** Script A reports what visibility currently holds, bounded by each namespace's own `retention_days`. Script B reports flow over its lookback. If the lookback is shorter than the retention, a gap between the two is arithmetic rather than a finding. When they do line up, a large gap points at retries, failed starts, or workflow-ID reuse.
 
+`actions_per_execution` reports `NO NEW EXECUTIONS - check CAN` only when the window has enough coverage to mean it. Below `MIN_COVERAGE` the cell is blank, because actions without starts is also just what a short window looks like.
+
 Duplicate scrape jobs multiply every absolute number while leaving every ratio correct. Script B detects this and reports it in the stderr preamble.
 
 Search attribute limits on Cloud are per type, so a comfortable-looking total can hide one type being over. `sa_limit_check` does that comparison.
