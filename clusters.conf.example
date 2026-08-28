@@ -1,0 +1,7 @@
+# clusters.conf   CLUSTER_ID <TAB> TEMPORAL_ENV
+# Lines starting with # are ignored. Columns MUST be separated by a real tab.
+# TEMPORAL_ENV is a profile name from `temporal env list`.
+
+prod-us-east-1	prod-us-east
+prod-eu-west-1	prod-eu-west
+staging-us-east-1	staging-us-east
